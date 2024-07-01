@@ -13,38 +13,61 @@ task :default => :clean do
   if ENV.fetch('RDKAFKA_EXT_PATH', '').empty?
     # Download and compile librdkafka if RDKAFKA_EXT_PATH is not set
     require "mini_portile2"
-    recipe = MiniPortile.new("librdkafka", Rdkafka::LIBRDKAFKA_VERSION)
 
-    # Use default homebrew openssl if we're on mac and the directory exists
-    # and each of flags is not empty
-    if recipe.host&.include?("darwin") && system("which brew &> /dev/null") && Dir.exist?("#{homebrew_prefix = %x(brew --prefix openssl).strip}")
-      ENV["CPPFLAGS"] = "-I#{homebrew_prefix}/include" unless ENV["CPPFLAGS"]
-      ENV["LDFLAGS"] = "-L#{homebrew_prefix}/lib" unless ENV["LDFLAGS"]
+    if RbConfig::CONFIG['host_os'] =~ /mswin|mingw|cygwin/
+      recipe = MiniPortileCMake.new("librdkafka", Rdkafka::LIBRDKAFKA_VERSION, make_command: "mingw32-make")
+      recipe.configure_options = [
+        "-G", "MinGW Makefiles",
+        "-D", "CMAKE_INSTALL_PREFIX=\"$PWD/dest/\"",
+        "-D", "WITHOUT_WIN32_CONFIG=ON",
+        "-D", "RDKAFKA_BUILD_EXAMPLES=ON",
+        "-D", "RDKAFKA_BUILD_TESTS=ON",
+        "-D", "RDKAFKA_BUILD_STATIC=OFF",
+        "-D", "CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=TRUE"
+      ]
+    else
+      # Download and compile librdkafka if RDKAFKA_EXT_PATH is not set
+      recipe = MiniPortile.new("librdkafka", Rdkafka::LIBRDKAFKA_VERSION)
+
+      # Use default homebrew openssl if we're on mac and the directory exists
+      # and each of flags is not empty
+      if recipe.host&.include?("darwin") && system("which brew &> /dev/null") && Dir.exist?("#{homebrew_prefix = %x(brew --prefix openssl).strip}")
+        ENV["CPPFLAGS"] = "-I#{homebrew_prefix}/include" unless ENV["CPPFLAGS"]
+        ENV["LDFLAGS"] = "-L#{homebrew_prefix}/lib" unless ENV["LDFLAGS"]
+      end
+
+      recipe.configure_options = ["--host=#{recipe.host}"]
+
+      # Disable using libc regex engine in favor of the embedded one
+      # The default regex engine of librdkafka does not always work exactly as most of the users
+      # would expect, hence this flag allows for changing it to the other one
+      if ENV.key?('RDKAFKA_DISABLE_REGEX_EXT')
+        recipe.configure_options << '--disable-regex-ext'
+      end
     end
 
     recipe.files << {
       :url => "https://codeload.github.com/edenhill/librdkafka/tar.gz/v#{Rdkafka::LIBRDKAFKA_VERSION}",
       :sha256 => Rdkafka::LIBRDKAFKA_SOURCE_SHA256
     }
-    recipe.configure_options = ["--host=#{recipe.host}"]
 
-    # Disable using libc regex engine in favor of the embedded one
-    # The default regex engine of librdkafka does not always work exactly as most of the users
-    # would expect, hence this flag allows for changing it to the other one
-    if ENV.key?('RDKAFKA_DISABLE_REGEX_EXT')
-      recipe.configure_options << '--disable-regex-ext'
-    end
+    cook(recipe, Rdkafka::LIBRDKAFKA_VERSION)
 
-    recipe.cook
     # Move dynamic library we're interested in
-    if recipe.host.include?('darwin')
+    if recipe.host.match?(/mswin|mingw|cygwin/)
+      from_extension = 'dll'
+      to_extension = 'dll'
+      lib_folder = 'bin'
+    elsif recipe.host.include?('darwin')
       from_extension = '1.dylib'
-      to_extension   = 'dylib'
+      to_extension = 'dylib'
+      lib_folder = 'lib'
     else
       from_extension = 'so.1'
       to_extension = 'so'
+      lib_folder = 'lib'
     end
-    lib_path = File.join(File.dirname(__FILE__), "ports/#{recipe.host}/librdkafka/#{Rdkafka::LIBRDKAFKA_VERSION}/lib/librdkafka.#{from_extension}")
+    lib_path = File.join(File.dirname(__FILE__), "ports/#{recipe.host}/librdkafka/#{Rdkafka::LIBRDKAFKA_VERSION}/#{lib_folder}/librdkafka.#{from_extension}")
     FileUtils.mv(lib_path, File.join(File.dirname(__FILE__), "librdkafka.#{to_extension}"))
     # Cleanup files created by miniportile we don't need in the gem
     FileUtils.rm_rf File.join(File.dirname(__FILE__), "tmp")
@@ -63,10 +86,14 @@ task :default => :clean do
 end
 
 task :clean do
+  FileUtils.rm_f File.join(File.dirname(__FILE__), "librdkafka.dll")
   FileUtils.rm_f File.join(File.dirname(__FILE__), "librdkafka.dylib")
   FileUtils.rm_f File.join(File.dirname(__FILE__), "librdkafka.so")
   FileUtils.rm_rf File.join(File.dirname(__FILE__), "ports")
   FileUtils.rm_rf File.join(File.dirname(__FILE__), "tmp")
+  Dir.glob(File.join(File.dirname(__FILE__), ".*.installed")).each do |file|
+    FileUtils.rm_f file
+  end
 end
 
 namespace :build do
@@ -75,15 +102,89 @@ namespace :build do
     ref = args[:ref]
     version = "git-#{ref}"
 
-    recipe = MiniPortile.new("librdkafka", version)
-    recipe.files << "https://github.com/edenhill/librdkafka/archive/#{ref}.tar.gz"
-    recipe.configure_options = ["--host=#{recipe.host}","--enable-static", "--enable-zstd"]
-    recipe.cook
+    require "mini_portile2"
 
-    ext = recipe.host.include?("darwin") ? "dylib" : "so"
-    lib = File.expand_path("ports/#{recipe.host}/librdkafka/#{version}/lib/librdkafka.#{ext}", __dir__)
+    if RbConfig::CONFIG['host_os'] =~ /mswin|mingw|cygwin/ and exced_win32_max_path(version)
+      # This gives us 66 characters more before hit MAX_PATH
+      version = "git-#{ref[0...7]}"
+    end
+
+    if RbConfig::CONFIG['host_os'] =~ /mswin|mingw|cygwin/
+      recipe = MiniPortileCMake.new("librdkafka", version, make_command: "mingw32-make")
+      recipe.configure_options = [
+        "-G", "MinGW Makefiles",
+        "-D", "CMAKE_INSTALL_PREFIX=\"$PWD/dest/\"",
+        "-D", "WITHOUT_WIN32_CONFIG=ON",
+        "-D", "RDKAFKA_BUILD_EXAMPLES=ON",
+        "-D", "RDKAFKA_BUILD_TESTS=ON",
+        "-D", "RDKAFKA_BUILD_STATIC=OFF",
+        "-D", "CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=TRUE"
+      ]
+      recipe.patch_files = [
+        File.join(File.dirname(__FILE__), "patches", "win32_allow_long_paths.diff")
+      ]
+    else
+      recipe = MiniPortile.new("librdkafka", version)
+      recipe.configure_options = ["--host=#{recipe.host}","--enable-static", "--enable-zstd"]
+    end
+
+    recipe.files << "https://github.com/edenhill/librdkafka/archive/#{ref}.tar.gz"
+    checkpoint = ".#{recipe.name}-#{recipe.version}.installed"
+
+    unless File.exist?(checkpoint)
+      cook(recipe, ref)
+      touch checkpoint
+    end
+
+    if recipe.host.match?(/mswin|mingw|cygwin/)
+      ext = 'dll'
+      lib_folder = 'bin'
+    elsif recipe.host.include?('darwin')
+      ext = 'dylib'
+      lib_folder = 'lib'
+    else
+      ext = 'so'
+      lib_folder = 'lib'
+    end
+    lib = File.expand_path("ports/#{recipe.host}/librdkafka/#{version}/#{lib_folder}/librdkafka.#{ext}", __dir__)
 
     # Copy will copy the content, following any symlinks
     FileUtils.cp(lib, __dir__)
+  end
+
+  # Specific to Windows-based systems, checks if CMakeTryCompile will generate paths longer than MAX_PATH.
+  # The function tries to anticipate the path to be generated by deducting some characters for the final comparison.
+  def exced_win32_max_path(version)
+    ref = version.gsub('git-', '')
+    dummy_recipe = MiniPortile.new("librdkafka", version)
+    # Example path CMakeTryCompile could generate during build process, wasted 67 characters less.
+    try_compile_obj_file_dir_example = 'CMakeFiles/CMakeScratch/TryCompile-p9t28r/CMakeFiles/cmTC_e7b3e.dir'
+    work_dir =  File.join(File.dirname(__FILE__), "tmp/#{dummy_recipe.host}/ports/#{dummy_recipe.name}/#{dummy_recipe.version}/librdkafka-#{ref}")
+    File.join(work_dir, try_compile_obj_file_dir_example).length > 250
+  end
+
+  # Recipe compile (cook) wrapper. Windows enforces a path length limit (MAX_PATH),
+  # therefore mingw32-make might fail to find files if they surpass this limit.
+  # This wrapper handles such cases for Windows-based systems.
+  def cook(recipe, version)
+    if recipe.host.match?(/mswin|mingw|cygwin/) and exced_win32_max_path(version)
+      tmp_path = "tmp/#{recipe.host}/ports/#{recipe.name}/#{recipe.version}"
+      work_dir =  File.join(File.dirname(__FILE__), tmp_path, "librdkafka-#{version}")
+
+      recipe.download
+      recipe.extract
+      new_dir_path = File.join(tmp_path, recipe.name)
+      File.rename(work_dir, new_dir_path)
+      begin
+        recipe.patch
+        recipe.configure
+        recipe.compile
+        recipe.install
+      rescue
+        File.rename(new_dir_path, work_dir)
+      end
+    else
+      recipe.cook
+    end
   end
 end
