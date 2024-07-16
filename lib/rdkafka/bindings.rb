@@ -17,6 +17,8 @@ module Rdkafka
     def self.lib_extension
       if RbConfig::CONFIG['host_os'] =~ /darwin/
         'dylib'
+      elsif RbConfig::CONFIG['host_os'] =~ /mswin|mingw|cygwin/
+        'dll'
       else
         'so'
       end
@@ -542,9 +544,9 @@ module Rdkafka
     class NativeError < FFI::Struct # rd_kafka_error_t
       layout :code, :int32,
              :errstr, :pointer,
-             :fatal, :u_int8_t,
-             :retriable, :u_int8_t,
-             :txn_requires_abort, :u_int8_t
+             :fatal, :uchar,
+             :retriable, :uchar,
+             :txn_requires_abort, :uchar
     end
 
     attach_function :rd_kafka_group_result_error, [:pointer], NativeError.by_ref # rd_kafka_group_result_t* => rd_kafka_error_t*
